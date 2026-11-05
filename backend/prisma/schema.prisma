@@ -1,0 +1,332 @@
+// AKY-KDS — Prisma şeması (Taslak v1, Aşama 1 / Hafta 5)
+//
+// Kapsam: yalnızca KLİNİK akış (hekim paneli). Tahlil yükleme (bilgilendirme)
+// modülü bu veritabanına YAZMAZ; yüklenen veri varsayılan olarak saklanmaz.
+//
+// Adlandırma: model/alan adları İngilizce (kod tarafı), tablo adları snake_case.
+// Açıklamalar Türkçe. Ayrıntılı açıklama: docs/er-diyagrami.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enum'lar
+// ─────────────────────────────────────────────────────────────
+
+/// Rol bazlı yetkilendirme (JWT içinde taşınır)
+enum Role {
+  PHYSICIAN // hekim: vaka görür, karar verir
+  ADMIN // yönetici: kullanıcı yönetimi, denetim kaydı ve onay oranı raporları
+}
+
+enum Sex {
+  MALE
+  FEMALE
+}
+
+/// Tahlil değerinin referans aralığına göre durumu (kural tabanlı kontrol)
+enum ResultFlag {
+  NORMAL
+  LOW
+  HIGH
+  CRITICAL_LOW
+  CRITICAL_HIGH
+}
+
+/// Vakanın (tahlil oturumunun) iş akışındaki durumu
+enum CaseStatus {
+  PENDING_PREDICTION // tahliller geldi, model servisi henüz çağrılmadı / hata
+  AWAITING_DECISION // öneri hazır, hekim kararı bekleniyor
+  DECIDED // hekim kararı verildi
+}
+
+/// Model çıktısının yönlendirme durumu
+enum PredictionStatus {
+  AUTO_SUGGESTION // güven skoru eşiğin üstünde
+  MANUAL_REVIEW // güven skoru eşiğin altında veya normal-sonuç koşullarından biri sağlanmadı
+}
+
+/// Hekimin karar türü
+enum DecisionType {
+  APPROVE // Top-3 önerilerinden birini onayladı ("Sevk gerekmiyor" dahil)
+  OVERRIDE // Top-3 dışında farklı bir bölüm seçti
+  REJECT // öneriyi reddetti, bölüm seçmedi (ör. yüz yüze muayene istendi)
+}
+
+/// Gerekçe kodu: override/red durumunda ve düşük güvenli vakada onayda ZORUNLU.
+/// Hekim reddi her zaman model hatası değildir; bu yüzden neden ayrıca tutulur.
+enum DecisionReason {
+  CLINICAL_JUDGEMENT // klinik muhakeme
+  PATIENT_HISTORY // hasta öyküsü / bilinen hastalık
+  DEPARTMENT_AVAILABILITY // bölüm doluluğu / kurum tercihi
+  SUSPECTED_MODEL_ERROR // modelin hatalı olduğu düşünülüyor
+  INSUFFICIENT_DATA // eksik tahlil / veri yetersiz
+  OTHER
+}
+
+enum NotificationChannel {
+  SMS_SIMULATED // prototipte gerçek SMS gönderilmez
+}
+
+enum NotificationTemplate {
+  REFERRAL // "Hekiminizin önerisiyle [Poliklinik] için randevu almanız önerilir."
+  NORMAL_RESULT // "Tahlil sonuçlarınızda referans aralığı dışında değer saptanmamıştır..."
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kullanıcılar
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  role         Role     @default(PHYSICIAN)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  decisions PhysicianDecision[]
+  auditLogs AuditLog[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Referans verileri (katalog)
+// ─────────────────────────────────────────────────────────────
+
+/// Uzmanlık sınıfları — docs/etiket-esleme.md ile birebir aynı kodlar.
+/// "Sevk gerekmiyor" da bir sınıftır (isReferral = false).
+model Specialty {
+  id         Int     @id @default(autoincrement())
+  code       String  @unique // ör. HEMATOLOGY, ENDOCRINOLOGY, NO_REFERRAL
+  nameTr     String  @map("name_tr")
+  isReferral Boolean @default(true) @map("is_referral")
+  isCritical Boolean @default(false) @map("is_critical") // duyarlılığa öncelik verilen bölümler
+  isActive   Boolean @default(true) @map("is_active") // v1'de dışlanan sınıflar (ör. tiroid) pasif tutulabilir
+
+  predictionItems   PredictionItem[]
+  selectedDecisions PhysicianDecision[]
+
+  @@map("specialties")
+}
+
+/// Tahlil kataloğu (ör. HGB, GLU, CREA). Gerçek kullanımda LOINC ile eşlenmeli.
+model LabTest {
+  id        Int     @id @default(autoincrement())
+  code      String  @unique // model servisindeki özellik adıyla aynı (ör. "hgb")
+  nameTr    String  @map("name_tr")
+  unit      String // standart birim (ör. g/dL)
+  loincCode String? @map("loinc_code")
+
+  referenceRanges ReferenceRange[]
+  results         LabResult[]
+
+  @@map("lab_tests")
+}
+
+/// Referans aralıkları cinsiyet ve yaşa göre değişebilir.
+model ReferenceRange {
+  id           Int    @id @default(autoincrement())
+  labTestId    Int    @map("lab_test_id")
+  sex          Sex? // null = her iki cinsiyet
+  ageMin       Int?   @map("age_min")
+  ageMax       Int?   @map("age_max")
+  low          Float?
+  high         Float?
+  criticalLow  Float? @map("critical_low")
+  criticalHigh Float? @map("critical_high")
+
+  labTest LabTest @relation(fields: [labTestId], references: [id])
+
+  @@index([labTestId])
+  @@map("reference_ranges")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Klinik veri
+// ─────────────────────────────────────────────────────────────
+
+/// Hasta — prototipte yalnızca SENTETİK kayıtlar. Veri minimizasyonu:
+/// ad-soyad / TC kimlik no tutulmaz; telefon yalnızca SMS simülasyonu içindir.
+model Patient {
+  id          String   @id @default(uuid())
+  protocolNo  String   @unique @map("protocol_no") // kurum içi protokol / sentetik kimlik
+  birthYear   Int      @map("birth_year")
+  sex         Sex
+  phoneMasked String?  @map("phone_masked") // ör. "05** *** 12 34"
+  isSynthetic Boolean  @default(true) @map("is_synthetic")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  cases         LabCase[]
+  notifications Notification[]
+
+  @@map("patients")
+}
+
+/// Vaka = bir hastanın tek seferde gelen tahlil seti (başvuru anı / ilk 24 saat).
+/// Tahmin, karar ve bildirim bu vakaya bağlanır.
+model LabCase {
+  id          String     @id @default(uuid())
+  patientId   String     @map("patient_id")
+  collectedAt DateTime   @map("collected_at")
+  ageAtCase   Int        @map("age_at_case")
+  status      CaseStatus @default(PENDING_PREDICTION)
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  patient    Patient            @relation(fields: [patientId], references: [id])
+  results    LabResult[]
+  prediction Prediction?
+  decision   PhysicianDecision?
+
+  @@index([patientId])
+  @@index([status])
+  @@map("lab_cases")
+}
+
+model LabResult {
+  id        String     @id @default(uuid())
+  caseId    String     @map("case_id")
+  labTestId Int        @map("lab_test_id")
+  value     Float
+  unit      String // gelen birim; standart birime çevrilmiş değer `value` alanındadır
+  flag      ResultFlag // kayıt anında referans aralığına göre hesaplanır
+
+  labCase LabCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  labTest LabTest @relation(fields: [labTestId], references: [id])
+
+  @@unique([caseId, labTestId])
+  @@map("lab_results")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Model çıktısı
+// ─────────────────────────────────────────────────────────────
+
+/// Model servisinin (FastAPI) bir vakaya verdiği yanıt.
+model Prediction {
+  id              String           @id @default(uuid())
+  caseId          String           @unique @map("case_id")
+  modelVersion    String           @map("model_version") // ör. "xgb-nhanes-v1.0"
+  status          PredictionStatus
+  topConfidence   Float            @map("top_confidence") // kalibre edilmiş Top-1 olasılığı
+  threshold       Float // o anki manuel inceleme eşiği (ör. 0.75)
+  allNormalByRule Boolean          @map("all_normal_by_rule") // kural tabanlı kontrol sonucu
+  rawResponse     Json             @map("raw_response") // servis yanıtının tamamı (izlenebilirlik)
+  latencyMs       Int?             @map("latency_ms")
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  labCase      LabCase          @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  items        PredictionItem[]
+  explanations Explanation[]
+
+  @@map("predictions")
+}
+
+/// Top-3 öneri satırları (rank 1..3)
+model PredictionItem {
+  id           String @id @default(uuid())
+  predictionId String @map("prediction_id")
+  rank         Int
+  specialtyId  Int    @map("specialty_id")
+  probability  Float // kalibre edilmiş olasılık
+
+  prediction Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+  specialty  Specialty  @relation(fields: [specialtyId], references: [id])
+
+  @@unique([predictionId, rank])
+  @@map("prediction_items")
+}
+
+/// SHAP tabanlı gerekçe — yalnızca önerilen (Top-1) sınıf için.
+/// text: SHAP + referans aralığını birleştiren şablon çıktısı.
+model Explanation {
+  id           String @id @default(uuid())
+  predictionId String @map("prediction_id")
+  featureCode  String @map("feature_code") // ör. "hgb"
+  featureValue Float? @map("feature_value")
+  shapValue    Float  @map("shap_value")
+  rank         Int // etki büyüklüğü sırası
+  text         String // "Hemoglobin referans aralığının altında (9,8 g/dL; ref 12–16) ..."
+
+  prediction Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  @@unique([predictionId, rank])
+  @@map("explanations")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Hekim kararı ve bildirim
+// ─────────────────────────────────────────────────────────────
+
+/// Her vaka için tek nihai hekim kararı. Override kayıtları ileride
+/// (inceleme sonrası) denetimli yeniden eğitim için veri kaynağıdır.
+model PhysicianDecision {
+  id                  String          @id @default(uuid())
+  caseId              String          @unique @map("case_id")
+  physicianId         String          @map("physician_id")
+  type                DecisionType
+  selectedSpecialtyId Int?            @map("selected_specialty_id") // REJECT'te null
+  selectedRank        Int?            @map("selected_rank") // Top-3'ten seçildiyse 1..3, OVERRIDE'da null
+  reason              DecisionReason? // OVERRIDE/REJECT ve MANUAL_REVIEW onayında zorunlu (servis katmanında kontrol)
+  note                String?
+  timeToDecisionMs    Int?            @map("time_to_decision_ms") // körü körüne onay izleme
+  decidedAt           DateTime        @default(now()) @map("decided_at")
+
+  labCase           LabCase       @relation(fields: [caseId], references: [id])
+  physician         User          @relation(fields: [physicianId], references: [id])
+  selectedSpecialty Specialty?    @relation(fields: [selectedSpecialtyId], references: [id])
+  notification      Notification?
+
+  @@index([physicianId])
+  @@map("physician_decisions")
+}
+
+/// SMS simülasyonu. Mesajda tanı veya tahlil bilgisi YER ALMAZ.
+model Notification {
+  id         String               @id @default(uuid())
+  decisionId String               @unique @map("decision_id")
+  patientId  String               @map("patient_id")
+  channel    NotificationChannel  @default(SMS_SIMULATED)
+  template   NotificationTemplate
+  message    String
+  createdAt  DateTime             @default(now()) @map("created_at")
+
+  decision PhysicianDecision @relation(fields: [decisionId], references: [id])
+  patient  Patient           @relation(fields: [patientId], references: [id])
+
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Denetim kaydı (append-only)
+// ─────────────────────────────────────────────────────────────
+
+/// Değiştirilemezlik: uygulama yalnızca INSERT yapar; ayrıca her satır bir
+/// önceki satırın hash'ini içerir (hash zinciri). Aşama 4'te UPDATE/DELETE'i
+/// engelleyen bir PostgreSQL trigger'ı migration olarak eklenecek.
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    String?  @map("actor_id") // sistem işlemlerinde null
+  action     String // ör. LOGIN, PREDICTION_CREATED, DECISION_APPROVE, DECISION_OVERRIDE, SMS_SIMULATED
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  payload    Json?
+  ipAddress  String?  @map("ip_address")
+  prevHash   String?  @map("prev_hash")
+  hash       String   @unique
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

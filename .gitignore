@@ -1,0 +1,46 @@
+# ── Genel ──
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.log
+~$*.xlsx
+
+# ── Ortam değişkenleri / gizli bilgiler ──
+.env
+.env.*
+!.env.example
+
+# ── Veri (ASLA commit edilmez; MIMIC-IV DUA ve KVKK) ──
+model/data/raw/*
+model/data/processed/*
+!model/data/raw/.gitkeep
+!model/data/processed/.gitkeep
+*.xpt
+*.XPT
+*.csv.gz
+*.parquet
+
+# ── Model çıktıları ──
+model/artifacts/*
+!model/artifacts/.gitkeep
+*.joblib
+*.pkl
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node ──
+node_modules/
+dist/
+build/
+coverage/
+.turbo/

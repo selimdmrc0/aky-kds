@@ -1,0 +1,16 @@
+# Geliştirme ortamı — yalnızca yerel kullanım içindir.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: akykds-db
+    environment:
+      POSTGRES_USER: akykds
+      POSTGRES_PASSWORD: akykds_dev
+      POSTGRES_DB: akykds
+    ports:
+      - "5432:5432"
+    volumes:
+      - akykds-pgdata:/var/lib/postgresql/data
+
+volumes:
+  akykds-pgdata:
